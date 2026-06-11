@@ -12,7 +12,8 @@
 #include "tunnel_client.h"
 #include "tunnel_protocol.h"
 #include "config.h"
-#include <WiFiClientSecure.h>
+#include <NetworkClient.h>
+#include <NetworkClientSecure.h>
 #include <Arduino.h>
 #ifdef TUNNEL_TLS_VERIFY_CERT
   #include "certs.h"
@@ -20,16 +21,12 @@
 
 // ── Module-level state ────────────────────────────────────────────────────────
 
-// g_tunnel is WiFiClientSecure for both TLS and plain builds:
-//   - TLS build: handshake happens, cert optionally verified
-//   - Plain build: connect() without startHandshake → plain TCP via the same class
-// Using a single type avoids duplicating all I/O helpers.
 #ifdef USE_TLS_TUNNEL
-static WiFiClientSecure g_tunnel;
+static NetworkClientSecure g_tunnel;
 #else
-static WiFiClient g_tunnel;
+static NetworkClient g_tunnel;
 #endif
-static WiFiClient g_backend;  // per-request TCP connection to local backend
+static NetworkClient g_backend;  // per-request TCP connection to local backend
 
 // Called once before the first session. Sets TLS parameters when USE_TLS_TUNNEL.
 static void initTunnelClient() {
@@ -150,7 +147,7 @@ static bool extractJsonString(const String& json, const char* field, String& out
 
 // HTTPS GET /api/client-tunnel/{TUNNEL_ID} → proxyAddress field
 static String fetchProxyAddress() {
-  WiFiClientSecure https;
+  NetworkClientSecure https;
   https.setInsecure();  // cert validation skipped; fine for bootstrap call
   https.setTimeout(15);
 
@@ -352,7 +349,6 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
   // Send request + optional body
   g_backend.print(http_req);
   if (body_len > 0) g_backend.write(g_body_buf, body_len);
-  g_backend.flush();
 
   // Read response headers until \r\n\r\n
   String resp_raw;
