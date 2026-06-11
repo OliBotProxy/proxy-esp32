@@ -1,17 +1,9 @@
 #pragma once
 
-// ── WiFi credentials ──────────────────────────────────────────────────────────
-#define WIFI_SSID     "your-wifi-ssid"
-#define WIFI_PASSWORD "your-wifi-password"
-
-// ── Tunnel configuration ──────────────────────────────────────────────────────
-// Regional API hosts: api-us.oli.bot  |  api-eu.oli.bot  |  api-asia.oli.bot
-#define TUNNEL_API_HOST "api-us.oli.bot"
+// ── Tunnel API port ───────────────────────────────────────────────────────────
+// WiFi credentials, tunnel ID, API key, and API host are stored in NVS flash.
+// On first boot (or after reset) the device enters provisioning mode to collect them.
 #define TUNNEL_API_PORT 443
-
-// Tunnel ID and API key from the proxy-admin dashboard
-#define TUNNEL_ID      "your-tunnel-id"
-#define TUNNEL_API_KEY "your-subscriptionId_your-salt"
 
 // Plain-TCP tunnel port (server must have tunnel_port configured, default 8779)
 #define TUNNEL_PROXY_PORT_DEFAULT 8779
@@ -38,6 +30,13 @@
 // and ETH_CLK_MODE are normally defined by the board's pins_arduino.h
 // (e.g. esp32-p4-evboard uses TLK110 PHY on MDC=31, MDIO=52, POWER=51).
 // Only define them here if targeting a custom board that doesn't set them.
+
+// ── Provisioning ─────────────────────────────────────────────────────────────
+// GPIO held LOW for 3 s at boot clears NVS and enters provisioning mode.
+// Set to -1 to disable the reset pin.
+#define PROVISION_RESET_PIN   0          // GPIO0 = BOOT button on most boards
+// SoftAP SSID prefix (WiFi builds). A 6-hex chip-ID suffix is appended.
+#define PROVISION_AP_PREFIX   "proxy-esp32"
 
 // ── TLS tunnel cert validation (USE_TLS_TUNNEL builds) ───────────────────────
 // By default TLS is encrypted but the server cert is not verified (setInsecure).

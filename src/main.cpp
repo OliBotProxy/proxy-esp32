@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "config.h"
+#include "provisioning.h"
 #include "tunnel_client.h"
 
 #ifdef USE_ETHERNET
@@ -32,13 +33,11 @@ static void onEthEvent(arduino_event_id_t event) {
   }
 }
 
-static void connectEth() {
+static void connectNetwork() {
   log_i("Starting Ethernet (PHY type %d, addr %d, MDC %d, MDIO %d)",
         ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO);
   Network.onEvent(onEthEvent);
 #ifdef BOARD_WAVESHARE_ESP32P4_ETH
-  // Waveshare ESP32-P4-ETH: IP101 PHY; MDC/MDIO/POWER/CLK same as EVB.
-  // Pass PHY type directly to avoid redefining the TLK110 macro from pins_arduino.h.
   ETH.begin(ETH_PHY_IP101, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO,
             ETH_PHY_POWER, ETH_CLK_MODE);
 #else
@@ -60,10 +59,10 @@ static bool networkReady() { return s_eth_ready; }
 // ── WiFi (ESP32 DevKit and similar) ──────────────────────────────────────────
 #include <WiFi.h>
 
-static void connectEth() {
-  log_i("Connecting to WiFi: %s", WIFI_SSID);
+static void connectNetwork() {
+  log_i("Connecting to WiFi: %s", getWifiSsid());
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(getWifiSsid(), getWifiPass());
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print('.');
@@ -79,15 +78,26 @@ static bool networkReady() { return WiFi.status() == WL_CONNECTED; }
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(200);
   log_i("proxy-esp32 starting");
-  connectEth();
+
+  loadParams();
+  checkProvisioningReset();
+
+  if (!paramsLoaded()) {
+#ifdef USE_ETHERNET
+    connectNetwork();   // ETH needs to be up before we can serve the setup page
+#endif
+    runProvisioning();  // never returns; reboots after form submit
+  }
+
+  connectNetwork();
 }
 
 void loop() {
   if (!networkReady()) {
     log_w("Network lost, reconnecting...");
-    connectEth();
+    connectNetwork();
     return;
   }
 

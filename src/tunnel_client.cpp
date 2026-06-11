@@ -11,6 +11,7 @@
 
 #include "tunnel_client.h"
 #include "tunnel_protocol.h"
+#include "provisioning.h"
 #include "config.h"
 #include <NetworkClient.h>
 #include <NetworkClientSecure.h>
@@ -151,14 +152,14 @@ static String fetchProxyAddress() {
   https.setInsecure();  // cert validation skipped; fine for bootstrap call
   https.setTimeout(15);
 
-  if (!https.connect(TUNNEL_API_HOST, TUNNEL_API_PORT)) {
-    log_e("API connect failed: %s:%d", TUNNEL_API_HOST, TUNNEL_API_PORT);
+  if (!https.connect(getApiHost(), TUNNEL_API_PORT)) {
+    log_e("API connect failed: %s:%d", getApiHost(), TUNNEL_API_PORT);
     return "";
   }
 
-  https.printf("GET /api/client-tunnel/%s HTTP/1.1\r\n", TUNNEL_ID);
-  https.printf("Host: %s\r\n", TUNNEL_API_HOST);
-  https.printf("Authorization: Bearer %s\r\n", TUNNEL_API_KEY);
+  https.printf("GET /api/client-tunnel/%s HTTP/1.1\r\n", getTunnelId());
+  https.printf("Host: %s\r\n", getApiHost());
+  https.printf("Authorization: Bearer %s\r\n", getApiKey());
   https.print("Connection: close\r\n\r\n");
 
   // Read full response (headers + body)
@@ -526,19 +527,19 @@ void runTunnelSession() {
     buf[p++] = PROTOCOL_VERSION;
     buf[p++] = 0x00;  // no HTTP/2 or TLS backend capability
 
-    uint16_t tid_len = (uint16_t)strlen(TUNNEL_ID);
+    uint16_t tid_len = (uint16_t)strlen(getTunnelId());
     buf[p++] = (tid_len >> 8) & 0xFF; buf[p++] = tid_len & 0xFF;
-    memcpy(buf + p, TUNNEL_ID, tid_len); p += tid_len;
+    memcpy(buf + p, getTunnelId(), tid_len); p += tid_len;
 
-    uint16_t key_len = (uint16_t)strlen(TUNNEL_API_KEY);
+    uint16_t key_len = (uint16_t)strlen(getApiKey());
     buf[p++] = (key_len >> 8) & 0xFF; buf[p++] = key_len & 0xFF;
-    memcpy(buf + p, TUNNEL_API_KEY, key_len); p += key_len;
+    memcpy(buf + p, getApiKey(), key_len); p += key_len;
 
     if (!sendFrame(FRAME_CONNECT, 0, 0, buf, p)) {
       log_e("CONNECT send failed"); g_tunnel.stop(); return;
     }
   }
-  log_i("Sent CONNECT (tunnel_id=%s)", TUNNEL_ID);
+  log_i("Sent CONNECT (tunnel_id=%s)", getTunnelId());
 
   // 4. Read CONFIG frame
   uint8_t hdr[FRAME_HEADER_SIZE];
