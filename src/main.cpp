@@ -36,8 +36,15 @@ static void connectEth() {
   log_i("Starting Ethernet (PHY type %d, addr %d, MDC %d, MDIO %d)",
         ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO);
   Network.onEvent(onEthEvent);
+#ifdef BOARD_WAVESHARE_ESP32P4_ETH
+  // Waveshare ESP32-P4-ETH: IP101 PHY; MDC/MDIO/POWER/CLK same as EVB.
+  // Pass PHY type directly to avoid redefining the TLK110 macro from pins_arduino.h.
+  ETH.begin(ETH_PHY_IP101, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO,
+            ETH_PHY_POWER, ETH_CLK_MODE);
+#else
   ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO,
             ETH_PHY_POWER, ETH_CLK_MODE);
+#endif
   uint32_t deadline = millis() + 15000;
   while (!s_eth_ready && millis() < deadline) {
     delay(200);

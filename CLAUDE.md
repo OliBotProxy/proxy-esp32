@@ -11,14 +11,14 @@ Part of the rust-rpxy workspace: proxy server lives in `../rust-rpxy`, backend a
 | Environment | Board | Network | Tunnel | Port |
 |-------------|-------|---------|--------|------|
 | `esp32dev` | ESP32 DevKit | WiFi | Plain TCP | 8779 |
-| `esp32p4-eth` | ESP32-P4 EVB | Ethernet | TLS (mbedTLS) | 8778 |
+| `waveshare-esp32p4-eth` | Waveshare ESP32-P4-ETH | Ethernet (IP101 PHY) | TLS (mbedTLS) | 8778 |
 
 ```bash
 # WiFi + plain TCP (default)
 pio run -e esp32dev --target upload
 
-# Ethernet + TLS (ESP32-P4)
-pio run -e esp32p4-eth --target upload
+# Waveshare ESP32-P4-ETH + TLS
+pio run -e waveshare-esp32p4-eth --target upload
 
 pio device monitor   # 115200 baud
 ```
