@@ -50,6 +50,7 @@ static uint16_t g_backend_port;
 // PING keepalive tracking
 static uint32_t g_last_ping_ms;
 static bool     g_ping_pending;
+static uint8_t  g_ping_seq;     // monotonic counter in PING opaque[0], matches rust-client
 
 // Shared buffers (single-stream: REQUEST and body are sequential, not concurrent)
 static uint8_t g_frame_buf[MAX_REQUEST_PAYLOAD];  // incoming REQUEST payload
@@ -124,10 +125,11 @@ static void sendReset(uint32_t stream_id, uint16_t error_code) {
 
 static void sendPing() {
   uint8_t opaque[8] = {};
+  opaque[0] = ++g_ping_seq;
   sendFrame(FRAME_PING, 0, 0, opaque, 8);
   g_ping_pending = true;
   g_last_ping_ms = millis();
-  log_d("PING sent");
+  log_d("PING sent (seq=%u)", g_ping_seq);
 }
 
 // ── API: fetch proxy address ──────────────────────────────────────────────────
@@ -332,6 +334,11 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
         if (dlen >= 8) tunnelRead(opaque, 8);
         else if (dlen > 0) tunnelDrain(dlen);
         sendFrame(FRAME_PONG, 0, 0, opaque, 8);
+      } else if (dtype == FRAME_PONG) {
+        // Server echoed our PING — clear pending so the keepalive timer doesn't fire
+        if (dlen > 0 && !tunnelDrain(dlen)) { sendReset(stream_id, RESET_INTERNAL_ERROR); return; }
+        g_ping_pending = false;
+        g_last_ping_ms = millis();
       } else {
         if (!tunnelDrain(dlen)) { sendReset(stream_id, RESET_INTERNAL_ERROR); return; }
       }
@@ -565,6 +572,7 @@ void runTunnelSession() {
   // 5. Main request loop
   g_last_ping_ms = millis();
   g_ping_pending = false;
+  g_ping_seq = 0;
   bool running = true;
 
   while (running && g_tunnel.connected()) {
