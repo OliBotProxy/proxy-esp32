@@ -43,9 +43,32 @@ static void initTunnelClient() {
 #endif
 }
 
-// Backend address populated from the first CONFIG domain mapping
+// Per-domain backend routing table, populated from the CONFIG frame.
+// g_backend_host/g_backend_port mirror the first domain and remain as the
+// fallback target for domain_ids that didn't fit in the table.
+struct DomainBackend {
+  uint16_t domain_id;
+  char     host[128];
+  uint16_t port;
+};
+static DomainBackend g_domain_backends[MAX_TUNNEL_DOMAINS];
+static uint8_t       g_domain_backend_count;
+
 static char     g_backend_host[128];
 static uint16_t g_backend_port;
+
+// Look up the backend for a domain_id from the CONFIG frame. Returns false
+// (leaving *out_host/*out_port untouched) if domain_id isn't in the table.
+static bool resolveBackend(uint16_t domain_id, const char** out_host, uint16_t* out_port) {
+  for (uint8_t i = 0; i < g_domain_backend_count; i++) {
+    if (g_domain_backends[i].domain_id == domain_id) {
+      *out_host = g_domain_backends[i].host;
+      *out_port = g_domain_backends[i].port;
+      return true;
+    }
+  }
+  return false;
+}
 
 // PING keepalive tracking
 static uint32_t g_last_ping_ms;
@@ -223,25 +246,43 @@ static bool parseConfig(const uint8_t* payload, uint32_t len) {
   uint16_t count = ((uint16_t)payload[0] << 8) | payload[1];
   uint32_t pos = 2;
   char domain_str[128], local_host[128];
+  g_domain_backend_count = 0;
 
   for (uint16_t i = 0; i < count; i++) {
     if (pos + 3 > len) return false;
-    // domain_id (u16), flags (u8) — we only need local_host for the first entry
-    pos += 3;
+    uint16_t domain_id = ((uint16_t)payload[pos] << 8) | payload[pos + 1];
+    pos += 3;  // domain_id (u16) + flags (u8)
     if (!readU16Str(payload, len, &pos, domain_str, sizeof(domain_str))) return false;
     if (!readU16Str(payload, len, &pos, local_host, sizeof(local_host))) return false;
 
-    if (i == 0) {
-      char* colon = strrchr(local_host, ':');
-      if (colon) {
-        *colon = '\0';
-        g_backend_port = (uint16_t)atoi(colon + 1);
-      } else {
-        g_backend_port = 80;
-      }
-      strlcpy(g_backend_host, local_host, sizeof(g_backend_host));
-      log_i("Backend from CONFIG: %s:%u", g_backend_host, g_backend_port);
+    char host_only[128];
+    uint16_t port;
+    char* colon = strrchr(local_host, ':');
+    if (colon) {
+      size_t hlen = min((size_t)(colon - local_host), sizeof(host_only) - 1);
+      memcpy(host_only, local_host, hlen);
+      host_only[hlen] = '\0';
+      port = (uint16_t)atoi(colon + 1);
+    } else {
+      strlcpy(host_only, local_host, sizeof(host_only));
+      port = 80;
     }
+
+    if (g_domain_backend_count < MAX_TUNNEL_DOMAINS) {
+      DomainBackend& b = g_domain_backends[g_domain_backend_count++];
+      b.domain_id = domain_id;
+      strlcpy(b.host, host_only, sizeof(b.host));
+      b.port = port;
+    } else {
+      log_w("Domain %s (id=%u) exceeds MAX_TUNNEL_DOMAINS (%d) — will fall back to domain 0's backend",
+            domain_str, domain_id, MAX_TUNNEL_DOMAINS);
+    }
+
+    if (i == 0) {
+      strlcpy(g_backend_host, host_only, sizeof(g_backend_host));
+      g_backend_port = port;
+    }
+    log_i("Backend from CONFIG: domain_id=%u %s -> %s:%u", domain_id, domain_str, host_only, port);
   }
   return count > 0;
 }
@@ -275,9 +316,15 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
                           const uint8_t* payload, uint32_t payload_len) {
   uint32_t pos = 0;
 
-  // domain_id — ignored (single backend on ESP32)
   if (pos + 2 > payload_len) { sendReset(stream_id, RESET_INTERNAL_ERROR); return; }
+  uint16_t domain_id = ((uint16_t)payload[pos] << 8) | payload[pos + 1];
   pos += 2;
+
+  // Route to this domain's own backend; unknown/overflowed domain_ids fall
+  // back to the first CONFIG domain (see resolveBackend / MAX_TUNNEL_DOMAINS).
+  const char* backend_host = g_backend_host;
+  uint16_t    backend_port = g_backend_port;
+  resolveBackend(domain_id, &backend_host, &backend_port);
 
   // method (u8-str), path (u16-str)
   char method[16], path[512];
@@ -348,8 +395,8 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
   http_req += "\r\n";
 
   // Connect to local backend
-  if (!g_backend.connect(g_backend_host, g_backend_port)) {
-    log_e("Backend unreachable: %s:%u", g_backend_host, g_backend_port);
+  if (!g_backend.connect(backend_host, backend_port)) {
+    log_e("Backend unreachable: %s:%u (domain_id=%u)", backend_host, backend_port, domain_id);
     sendReset(stream_id, RESET_BACKEND_UNREACHABLE); return;
   }
   g_backend.setTimeout(10);

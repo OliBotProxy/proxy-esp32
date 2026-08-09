@@ -18,6 +18,9 @@
 #define PONG_TIMEOUT_MS  10000   // reconnect if no PONG within 10 s after PING
 
 // ── Buffers ───────────────────────────────────────────────────────────────────
+// Max domains from one CONFIG frame that get their own backend routing entry.
+// Extra domains beyond this count still work but fall back to the first domain's backend.
+#define MAX_TUNNEL_DOMAINS  8
 // Max REQUEST frame payload accepted (4 KB per ESP32 subset spec)
 #define MAX_REQUEST_PAYLOAD 4096
 // Max response body buffered before streaming as DATA frames

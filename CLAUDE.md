@@ -112,7 +112,7 @@ Full protocol spec is in `../rust-rpxy/rpxy-lib/src/tunnel/protocol.rs`.
 
 **CONNECT payload:** `version(1) + caps(1) + u16-len + tunnel_id + u16-len + api_key`
 
-**CONFIG payload:** `u16 domain_count` + per-domain `u16 domain_id + u8 flags + u16-str domain + u16-str local_host`. Only the first domain's `local_host` is used as the backend address.
+**CONFIG payload:** `u16 domain_count` + per-domain `u16 domain_id + u8 flags + u16-str domain + u16-str local_host`. Each domain's `local_host` is stored in a small routing table (`g_domain_backends`, up to `MAX_TUNNEL_DOMAINS`), keyed by `domain_id`; incoming REQUEST frames carry `domain_id` and are forwarded to that domain's own backend. Domains beyond `MAX_TUNNEL_DOMAINS` fall back to the first domain's backend.
 
 **REQUEST handling:**
 - Parse `domain_id(u16)`, `method(u8-str)`, `path(u16-str)`, headers `(u16 count + u8-str name + u16-str value)*`
@@ -152,8 +152,9 @@ board = az-delivery-devkit-v4
 | `g_drain_buf` | 256 B | global |
 | `resp_payload` | 4 KB | static local in `handleRequest` |
 | `data_payload` | 2 KB | static local in `handleRequest` |
+| `g_domain_backends` | ~1 KB (`MAX_TUNNEL_DOMAINS` × 132 B) | global (per-domain backend routing table) |
 
-Total static: ~42 KB. ESP32 has ~300 KB available heap — well within budget. `String` objects used for HTTP header parsing are short-lived and freed after each request.
+Total static: ~43 KB. ESP32 has ~300 KB available heap — well within budget. `String` objects used for HTTP header parsing are short-lived and freed after each request.
 
 ## API key format
 
