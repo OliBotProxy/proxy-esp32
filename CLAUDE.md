@@ -11,11 +11,15 @@ Part of the rust-rpxy workspace: proxy server lives in `../rust-rpxy`, backend a
 | Environment | Board | Network | Tunnel | Port |
 |-------------|-------|---------|--------|------|
 | `esp32dev` | ESP32 DevKit | WiFi | Plain TCP | 8779 |
+| `esp32-s3` | Generic ESP32-S3 (e.g. SparkleIoT XH-S3E) | WiFi | Plain TCP | 8779 |
 | `waveshare-esp32p4-eth` | Waveshare ESP32-P4-ETH | Ethernet (IP101 PHY) | TLS (mbedTLS) | 8778 |
 
 ```bash
 # WiFi + plain TCP (default)
 pio run -e esp32dev --target upload
+
+# Generic ESP32-S3 module (native USB-CDC serial)
+pio run -e esp32-s3 --target upload
 
 # Waveshare ESP32-P4-ETH + TLS
 pio run -e waveshare-esp32p4-eth --target upload
@@ -25,20 +29,31 @@ pio device monitor   # 115200 baud
 
 ## Quick start
 
-1. Edit `include/config.h` — set WiFi credentials (or Ethernet pin overrides), tunnel ID, API key.
-2. Flash with the appropriate environment above.
-3. The device connects to the network, fetches the proxy address from the API, then maintains a persistent tunnel connection.
+1. Flash with the appropriate environment above. No credentials are baked into the build —
+   `include/config.h` only holds protocol/timing constants, never secrets.
+2. On first boot (no stored credentials), the device starts its own captive-portal web
+   server (`runProvisioning()` in `provisioning.cpp`) — connect to it and submit WiFi
+   (or leave blank on Ethernet builds), tunnel ID, and API key via the form. These are
+   stored in NVS flash, never in source, so nothing secret ever needs to be committed.
+3. The device reboots, connects to the network, fetches the proxy address from the API,
+   then maintains a persistent tunnel connection.
+4. A built-in demo web server (`main.cpp`, runs on its own FreeRTOS task on core 0) serves
+   a status page on port 80 of the device's local IP — point a domain's `localIp` at
+   `<device-ip>:80` in the proxy-admin dashboard to expose it through a tunnel domain.
+   Hold `PROVISION_RESET_PIN` (GPIO0/BOOT button) for 3 s to clear stored credentials and
+   re-enter provisioning mode.
 
 ## Key files
 
 ```
 include/
-  config.h            — All user-editable settings (WiFi/ETH pins, tunnel ID, API key, ports)
+  config.h            — Protocol/timing constants only (ports, timeouts, buffer sizes) — no secrets
   tunnel_protocol.h   — Frame type / flag / reset-code constants
   certs.h             — ISRG Root X1 PEM cert (used when TUNNEL_TLS_VERIFY_CERT is defined)
 
 src/
-  main.cpp            — setup(): network init (WiFi or ETH); loop(): reconnect wrapper
+  main.cpp            — setup(): network init (WiFi or ETH) + demo web server task; loop(): reconnect wrapper
+  provisioning.cpp     — NVS credential storage + captive-portal setup form (first-boot / reset)
   tunnel_client.h     — Public API: runTunnelSession()
   tunnel_client.cpp   — Full tunnel session logic (plain TCP or TLS via USE_TLS_TUNNEL)
 ```
