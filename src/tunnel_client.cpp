@@ -578,11 +578,13 @@ void runTunnelSession() {
   while (running && g_tunnel.connected()) {
     uint32_t now = millis();
 
-    // Keepalive
+    // Keepalive. `else if` matters here: sendPing() refreshes g_last_ping_ms to a
+    // timestamp taken after `now` was captured, so checking the PONG-timeout branch
+    // in the same pass would underflow (now - g_last_ping_ms wraps to ~UINT32_MAX)
+    // and immediately declare a false timeout on every ping cycle.
     if (!g_ping_pending && (now - g_last_ping_ms >= PING_INTERVAL_MS)) {
       sendPing();
-    }
-    if (g_ping_pending && (now - g_last_ping_ms >= PONG_TIMEOUT_MS)) {
+    } else if (g_ping_pending && (now - g_last_ping_ms >= PONG_TIMEOUT_MS)) {
       log_e("PONG timeout — reconnecting");
       break;
     }
