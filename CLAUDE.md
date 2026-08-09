@@ -72,8 +72,8 @@ src/
 | `PING_INTERVAL_MS` | `30000` | How often to send PING frames |
 | `PONG_TIMEOUT_MS` | `10000` | Reconnect if no PONG within this window |
 | `MAX_REQUEST_PAYLOAD` | `4096` | Max REQUEST frame payload; larger → RESET |
-| `MAX_RESPONSE_BODY` | `32768` | Max response body buffered |
-| `DATA_CHUNK_SIZE` | `2048` | DATA frame chunk size |
+| `MAX_RESPONSE_BODY` | `32768` | Max REQUEST *body* buffered (browser→backend). Response bodies are streamed, not size-capped |
+| `DATA_CHUNK_SIZE` | `2048` | DATA frame chunk size, and streaming read chunk size |
 
 ## Session flow
 
@@ -108,6 +108,8 @@ Full protocol spec is in `../rust-rpxy/rpxy-lib/src/tunnel/protocol.rs`.
 - **TLS without cert verification by default** — define `TUNNEL_TLS_VERIFY_CERT` in `config.h` to validate against ISRG Root X1 (`certs.h`)
 - **Single-stream** — one request handled to completion before the next is read
 - **4 KB REQUEST cap** — oversized frames answered with RESET, not a crash
+- **Response bodies are streamed, not buffered** — read from the backend and relayed as DATA frames on the fly (`readBackendChunk`/`readBackendLine` in `tunnel_client.cpp`), so response size isn't capped by device RAM the way `MAX_RESPONSE_BODY` caps the request body
+- **Requests are still handled one at a time** — a browser's parallel asset fetches queue up and get served sequentially, not concurrently. To stop a slow multi-request page load from killing the whole tunnel connection, `serviceTunnelKeepalive()` is polled from inside the backend-read idle loops during response streaming: it answers/consumes any PING or PONG already queued from the server and sends the client's own scheduled PING, while leaving any other queued frame (e.g. another REQUEST from a parallel fetch) untouched for the outer loop to process once the current request finishes
 - **`capabilities = 0x00`** — no HTTP/2 or TLS backend support advertised
 
 **CONNECT payload:** `version(1) + caps(1) + u16-len + tunnel_id + u16-len + api_key`
@@ -118,8 +120,8 @@ Full protocol spec is in `../rust-rpxy/rpxy-lib/src/tunnel/protocol.rs`.
 - Parse `domain_id(u16)`, `method(u8-str)`, `path(u16-str)`, headers `(u16 count + u8-str name + u16-str value)*`
 - If `FLAG_HAS_BODY (0x01)`: read DATA frames synchronously until `FLAG_END_STREAM (0x01)`
 - Forward as HTTP/1.1 with `Connection: close` to local backend (TCP)
-- Read response: parse status + headers, dechunk if needed, cap at `MAX_RESPONSE_BODY`
-- Send `RESPONSE` frame then `DATA` frames in `DATA_CHUNK_SIZE` chunks
+- Read response headers (buffered, small), then send the `RESPONSE` frame
+- Stream the body straight from the backend into `DATA` frames (`DATA_CHUNK_SIZE` per read), dechunking on the fly for `Transfer-Encoding: chunked`; last `DATA` frame carries `FLAG_END_STREAM`. Body is never fully buffered, so there's no size cap here (see `MAX_RESPONSE_BODY` note above)
 
 ## Proxy server setup
 
@@ -148,13 +150,13 @@ board = az-delivery-devkit-v4
 | Buffer | Size | Location |
 |--------|------|----------|
 | `g_frame_buf` | 4 KB | global (REQUEST payload) |
-| `g_body_buf` | 32 KB | global (request + response body, sequential) |
+| `g_body_buf` | 32 KB | global (REQUEST body only, browser→backend) |
 | `g_drain_buf` | 256 B | global |
-| `resp_payload` | 4 KB | static local in `handleRequest` |
-| `data_payload` | 2 KB | static local in `handleRequest` |
+| `resp_payload` | 4 KB | static local in `handleRequest` (response headers) |
+| `stream_buf` | 2 KB | static local in `handleRequest` (response body streaming, reused per chunk — response size is unbounded, not buffered) |
 | `g_domain_backends` | ~1 KB (`MAX_TUNNEL_DOMAINS` × 132 B) | global (per-domain backend routing table) |
 
-Total static: ~43 KB. ESP32 has ~300 KB available heap — well within budget. `String` objects used for HTTP header parsing are short-lived and freed after each request.
+Total static: ~43 KB. ESP32 has ~300 KB available heap — well within budget. `String` objects used for HTTP header parsing are short-lived and freed after each request. Response bodies stream through the fixed 2 KB `stream_buf` regardless of total size — a 1 MB backend response costs the same RAM as a 1 KB one, just more DATA frames.
 
 ## API key format
 

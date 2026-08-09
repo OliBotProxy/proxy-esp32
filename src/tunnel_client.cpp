@@ -70,10 +70,16 @@ static bool resolveBackend(uint16_t domain_id, const char** out_host, uint16_t* 
   return false;
 }
 
-// PING keepalive tracking
-static uint32_t g_last_ping_ms;
+// Keepalive tracking — idle-based: a PING is sent only once nothing has been
+// received for PING_INTERVAL_MS. Any received frame (not just PONG) proves the
+// channel is alive and clears g_ping_pending, so actively flowing traffic
+// (e.g. relaying a large response) naturally suppresses ping churn; pings only
+// happen during genuine idle gaps.
+static uint32_t g_last_rx_ms;    // last time any frame was received from the tunnel
+static uint32_t g_ping_sent_ms;  // when the outstanding ping was sent (valid while g_ping_pending)
 static bool     g_ping_pending;
-static uint8_t  g_ping_seq;     // monotonic counter in PING opaque[0], matches rust-client
+static bool     g_tunnel_dead;   // set once a pending ping goes unanswered too long
+static uint8_t  g_ping_seq;      // monotonic counter in PING opaque[0], matches rust-client
 
 // Shared buffers (single-stream: REQUEST and body are sequential, not concurrent)
 static uint8_t g_frame_buf[MAX_REQUEST_PAYLOAD];  // incoming REQUEST payload
@@ -151,8 +157,65 @@ static void sendPing() {
   opaque[0] = ++g_ping_seq;
   sendFrame(FRAME_PING, 0, 0, opaque, 8);
   g_ping_pending = true;
-  g_last_ping_ms = millis();
+  g_ping_sent_ms = millis();
   log_d("PING sent (seq=%u)", g_ping_seq);
+}
+
+// Call whenever any frame is successfully read from the tunnel — proves the
+// channel is alive right now, regardless of frame type.
+static void noteFrameReceived() {
+  g_last_rx_ms = millis();
+  g_ping_pending = false;
+}
+
+// Idle-triggered keepalive: sends a PING only after PING_INTERVAL_MS with
+// nothing received (see noteFrameReceived), and sets g_tunnel_dead if a
+// pending PING goes unanswered for PONG_TIMEOUT_MS. Safe to call from
+// anywhere, including mid-stream — it's a no-op while traffic is flowing.
+static void checkKeepalive() {
+  if (g_tunnel_dead) return;
+  uint32_t now = millis();
+  if (g_ping_pending) {
+    if (now - g_ping_sent_ms >= PONG_TIMEOUT_MS) {
+      log_e("Keepalive timeout — nothing received since PING sent %lums ago", (unsigned long)(now - g_ping_sent_ms));
+      g_tunnel_dead = true;
+    }
+  } else if (now - g_last_rx_ms >= PING_INTERVAL_MS) {
+    sendPing();
+  }
+}
+
+// Service the tunnel socket's keepalive while handleRequest() is busy relaying
+// a slow backend response (single-stream: the outer loop's own keepalive check
+// doesn't run again until the current request finishes). Answers/consumes any
+// PING or PONG already queued from the server, but leaves any other queued
+// frame type (e.g. another REQUEST from a parallel browser fetch) completely
+// untouched for the outer loop to process once this request is done — call
+// from idle waits in the backend-read helpers.
+static void serviceTunnelKeepalive() {
+  if (!g_tunnel.connected()) return;
+
+  while (g_tunnel.available() > 0) {
+    int next = g_tunnel.peek();
+    if (next != FRAME_PING && next != FRAME_PONG) break;
+
+    uint8_t hdr[FRAME_HEADER_SIZE];
+    if (!tunnelRead(hdr, FRAME_HEADER_SIZE, 2000)) return;
+    uint32_t flen = ((uint32_t)hdr[6] << 24) | ((uint32_t)hdr[7] << 16) |
+                    ((uint32_t)hdr[8] <<  8) | hdr[9];
+    noteFrameReceived();
+
+    if (hdr[0] == FRAME_PING) {
+      uint8_t opaque[8] = {};
+      if (flen >= 8) { if (!tunnelRead(opaque, 8)) return; if (flen > 8) tunnelDrain(flen - 8); }
+      else if (flen > 0) tunnelDrain(flen);
+      sendFrame(FRAME_PONG, 0, 0, opaque, 8);
+    } else {  // FRAME_PONG
+      if (flen > 0) tunnelDrain(flen);
+    }
+  }
+
+  checkKeepalive();
 }
 
 // ── API: fetch proxy address ──────────────────────────────────────────────────
@@ -287,27 +350,57 @@ static bool parseConfig(const uint8_t* payload, uint32_t len) {
   return count > 0;
 }
 
-// ── Chunked transfer decoding ─────────────────────────────────────────────────
+// ── Streaming backend response reader ─────────────────────────────────────────
+// The response body is relayed to the tunnel as DATA frames while it's being
+// read from the backend, never fully buffered — so response size isn't capped
+// by MAX_RESPONSE_BODY (that buffer is used for the request body only).
 
-static uint32_t dechunk(uint8_t* data, uint32_t len) {
-  uint32_t out = 0, pos = 0;
-  while (pos < len) {
-    uint32_t line_end = pos;
-    while (line_end + 1 < len && !(data[line_end] == '\r' && data[line_end + 1] == '\n'))
-      line_end++;
-    if (line_end + 1 >= len) break;
-    char sz[12] = {};
-    uint32_t sz_len = min((uint32_t)(line_end - pos), (uint32_t)(sizeof(sz) - 1));
-    memcpy(sz, data + pos, sz_len);
-    uint32_t chunk_size = (uint32_t)strtoul(sz, nullptr, 16);
-    pos = line_end + 2;
-    if (chunk_size == 0) break;
-    if (pos + chunk_size > len) { chunk_size = len - pos; }
-    memmove(data + out, data + pos, chunk_size);
-    out += chunk_size;
-    pos += chunk_size + 2;  // skip chunk data + trailing \r\n
+// Read up to `max_len` bytes from g_backend into buf. Waits up to `timeout_ms`
+// for the first byte, then drains whatever else is immediately available and
+// returns promptly rather than blocking to fill the buffer (keeps DATA frames
+// flowing at backend speed instead of batching). Returns 0 on idle timeout or
+// backend close with nothing pending (both signal "no more data right now").
+static uint32_t readBackendChunk(uint8_t* buf, uint32_t max_len, uint32_t timeout_ms) {
+  uint32_t got = 0;
+  uint32_t deadline = millis() + timeout_ms;
+  while (got < max_len) {
+    if (g_backend.available()) {
+      int n = g_backend.read(buf + got, max_len - got);
+      if (n > 0) { got += n; deadline = millis() + timeout_ms; continue; }
+    }
+    if (got > 0) break;
+    if (!g_backend.connected()) break;
+    if ((int32_t)(millis() - deadline) >= 0) break;
+    serviceTunnelKeepalive();
+    if (g_tunnel_dead) break;
+    delay(2);
   }
-  return out;
+  return got;
+}
+
+// Read one CRLF-terminated line (chunk-size line, or a chunk's trailing CRLF)
+// from g_backend. Returns line length (CRLF stripped, 0 for a bare blank line),
+// or -1 on timeout/backend close before a newline arrived.
+static int readBackendLine(char* out, size_t out_max, uint32_t timeout_ms) {
+  size_t n = 0;
+  uint32_t deadline = millis() + timeout_ms;
+  while (true) {
+    if (g_backend.available()) {
+      char c = (char)g_backend.read();
+      if (c == '\n') {
+        if (n > 0 && out[n - 1] == '\r') n--;
+        out[n] = '\0';
+        return (int)n;
+      }
+      if (n < out_max - 1) out[n++] = c;
+      continue;
+    }
+    if (!g_backend.connected()) return -1;
+    if ((int32_t)(millis() - deadline) >= 0) return -1;
+    serviceTunnelKeepalive();
+    if (g_tunnel_dead) return -1;
+    delay(2);
+  }
 }
 
 // ── REQUEST handler ───────────────────────────────────────────────────────────
@@ -361,6 +454,7 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
       if (!tunnelRead(dhdr, FRAME_HEADER_SIZE, 8000)) {
         sendReset(stream_id, RESET_INTERNAL_ERROR); return;
       }
+      noteFrameReceived();
       uint8_t  dtype  = dhdr[0];
       uint8_t  dflags = dhdr[5];
       uint32_t dlen   = ((uint32_t)dhdr[6] << 24) | ((uint32_t)dhdr[7] << 16) |
@@ -382,10 +476,7 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
         else if (dlen > 0) tunnelDrain(dlen);
         sendFrame(FRAME_PONG, 0, 0, opaque, 8);
       } else if (dtype == FRAME_PONG) {
-        // Server echoed our PING — clear pending so the keepalive timer doesn't fire
         if (dlen > 0 && !tunnelDrain(dlen)) { sendReset(stream_id, RESET_INTERNAL_ERROR); return; }
-        g_ping_pending = false;
-        g_last_ping_ms = millis();
       } else {
         if (!tunnelDrain(dlen)) { sendReset(stream_id, RESET_INTERNAL_ERROR); return; }
       }
@@ -416,6 +507,8 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
     }
     if (headers_done) break;
     if (!g_backend.connected() && !g_backend.available()) break;
+    serviceTunnelKeepalive();
+    if (g_tunnel_dead) break;
     delay(2);
   }
   if (!headers_done) {
@@ -459,51 +552,12 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
     line_start = line_end + 2;
   }
 
-  // Collect response body
-  uint32_t resp_body_len = 0;
-  if (!no_body) {
-    uint32_t body_deadline = millis() + 10000;
-    if (content_length >= 0) {
-      uint32_t cl = min((uint32_t)content_length, (uint32_t)MAX_RESPONSE_BODY);
-      while (resp_body_len < cl && millis() < body_deadline) {
-        while (g_backend.available() && resp_body_len < cl)
-          g_body_buf[resp_body_len++] = (uint8_t)g_backend.read();
-        if (resp_body_len < cl) delay(2);
-      }
-    } else if (is_chunked) {
-      while (millis() < body_deadline && resp_body_len < MAX_RESPONSE_BODY) {
-        while (g_backend.available() && resp_body_len < MAX_RESPONSE_BODY)
-          g_body_buf[resp_body_len++] = (uint8_t)g_backend.read();
-        // Look for chunked terminator
-        if (resp_body_len >= 5) {
-          for (uint32_t k = resp_body_len < 10 ? 0 : resp_body_len - 10; k < resp_body_len - 4; k++) {
-            if (memcmp(g_body_buf + k, "0\r\n\r\n", 5) == 0) goto body_done;
-          }
-        }
-        if (!g_backend.connected() && !g_backend.available()) break;
-        delay(2);
-      }
-      body_done:
-      resp_body_len = dechunk(g_body_buf, resp_body_len);
-    } else {
-      while (millis() < body_deadline && resp_body_len < MAX_RESPONSE_BODY) {
-        while (g_backend.available() && resp_body_len < MAX_RESPONSE_BODY)
-          g_body_buf[resp_body_len++] = (uint8_t)g_backend.read();
-        if (!g_backend.connected() && !g_backend.available()) break;
-        delay(2);
-      }
-    }
-  }
-  g_backend.stop();
-
-  // Ensure Content-Length header reflects actual body
-  bool has_cl = false;
-  for (uint16_t i = 0; i < resp_hdr_count; i++) {
-    String nl = resp_headers[i].name; nl.toLowerCase();
-    if (nl == "content-length") { resp_headers[i].value = String(resp_body_len); has_cl = true; break; }
-  }
-  if (!has_cl && resp_hdr_count < 32)
-    resp_headers[resp_hdr_count++] = { "content-length", String(resp_body_len) };
+  // Note: resp_headers still carries the backend's original content-length (if any)
+  // verbatim — we no longer rewrite it, since the body below is streamed rather
+  // than buffered so the true length is never truncated. For chunked/unknown-length
+  // responses no content-length header was captured above (transfer-encoding is
+  // stripped, and a close-delimited response never had one); the proxy fills it in
+  // server-side once all DATA frames are collected.
 
   // Build RESPONSE frame payload: u16 status + u16 count + [u8 nlen + name + u16 vlen + value]*
   static uint8_t resp_payload[4096];
@@ -524,24 +578,74 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
     memcpy(resp_payload + rp, v, vlen); rp += vlen;
   }
 
-  uint8_t resp_flags = (resp_body_len > 0) ? FLAG_RESPONSE_HAS_BODY : 0;
+  uint8_t resp_flags = no_body ? 0 : FLAG_RESPONSE_HAS_BODY;
   sendFrame(FRAME_RESPONSE, stream_id, resp_flags, resp_payload, rp);
 
-  // Send DATA frames (DATA_CHUNK_SIZE bytes each, END_STREAM on last)
-  if (resp_body_len > 0) {
-    static uint8_t data_payload[DATA_CHUNK_SIZE];
-    uint32_t sent = 0;
-    while (sent < resp_body_len) {
-      uint32_t chunk = min((uint32_t)DATA_CHUNK_SIZE, resp_body_len - sent);
-      bool last = (sent + chunk == resp_body_len);
-      memcpy(data_payload, g_body_buf + sent, chunk);
-      sendFrame(FRAME_DATA, stream_id, last ? FLAG_END_STREAM : 0, data_payload, chunk);
-      sent += chunk;
-    }
-  }
+  // Stream the response body straight from the backend into DATA frames —
+  // never fully buffered, so size isn't capped by MAX_RESPONSE_BODY.
+  uint32_t streamed_total = 0;
+  if (!no_body) {
+    static uint8_t stream_buf[DATA_CHUNK_SIZE];
+    bool end_stream_sent = false;
 
-  log_d("stream %lu: %s %s -> %u (%lu B)", (unsigned long)stream_id,
-        method, path, status_code, (unsigned long)resp_body_len);
+    if (content_length >= 0) {
+      uint32_t remaining = (uint32_t)content_length;
+      while (remaining > 0) {
+        uint32_t want = min((uint32_t)DATA_CHUNK_SIZE, remaining);
+        uint32_t got = readBackendChunk(stream_buf, want, 10000);
+        if (got == 0) break;  // backend closed/stalled early — end the stream with what we have
+        remaining -= got;
+        streamed_total += got;
+        bool last = (remaining == 0);
+        sendFrame(FRAME_DATA, stream_id, last ? FLAG_END_STREAM : 0, stream_buf, got);
+        if (last) end_stream_sent = true;
+        serviceTunnelKeepalive();
+      }
+    } else if (is_chunked) {
+      char line[16];
+      while (true) {
+        int n = readBackendLine(line, sizeof(line), 10000);
+        if (n < 0) break;  // timeout/close mid-stream — end with what we have
+        uint32_t chunk_size = (uint32_t)strtoul(line, nullptr, 16);
+        if (chunk_size == 0) {
+          char trail[4];
+          readBackendLine(trail, sizeof(trail), 2000);  // trailing CRLF after "0"
+          break;
+        }
+        uint32_t remaining = chunk_size;
+        bool chunk_ok = true;
+        while (remaining > 0) {
+          uint32_t want = min((uint32_t)DATA_CHUNK_SIZE, remaining);
+          uint32_t got = readBackendChunk(stream_buf, want, 10000);
+          if (got == 0) { chunk_ok = false; break; }
+          remaining -= got;
+          streamed_total += got;
+          sendFrame(FRAME_DATA, stream_id, 0, stream_buf, got);
+          serviceTunnelKeepalive();
+        }
+        if (!chunk_ok) break;
+        char crlf[4];
+        readBackendLine(crlf, sizeof(crlf), 2000);  // trailing CRLF after chunk data
+      }
+    } else {
+      // No Content-Length, not chunked — read until the backend closes (expected,
+      // since our own outgoing request always sends "Connection: close").
+      const uint32_t SAFETY_CAP = 8UL * 1024 * 1024;  // guards against a backend that never closes
+      while (streamed_total < SAFETY_CAP) {
+        uint32_t got = readBackendChunk(stream_buf, DATA_CHUNK_SIZE, 10000);
+        if (got == 0) break;
+        streamed_total += got;
+        sendFrame(FRAME_DATA, stream_id, 0, stream_buf, got);
+        serviceTunnelKeepalive();
+      }
+    }
+
+    if (!end_stream_sent) sendFrame(FRAME_DATA, stream_id, FLAG_END_STREAM, nullptr, 0);
+  }
+  g_backend.stop();
+
+  log_d("stream %lu: %s %s -> %u (%lu B streamed)", (unsigned long)stream_id,
+        method, path, status_code, (unsigned long)streamed_total);
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -617,24 +721,15 @@ void runTunnelSession() {
   log_i("Session established. Backend: %s:%u", g_backend_host, g_backend_port);
 
   // 5. Main request loop
-  g_last_ping_ms = millis();
+  g_last_rx_ms = millis();
   g_ping_pending = false;
+  g_tunnel_dead = false;
   g_ping_seq = 0;
   bool running = true;
 
   while (running && g_tunnel.connected()) {
-    uint32_t now = millis();
-
-    // Keepalive. `else if` matters here: sendPing() refreshes g_last_ping_ms to a
-    // timestamp taken after `now` was captured, so checking the PONG-timeout branch
-    // in the same pass would underflow (now - g_last_ping_ms wraps to ~UINT32_MAX)
-    // and immediately declare a false timeout on every ping cycle.
-    if (!g_ping_pending && (now - g_last_ping_ms >= PING_INTERVAL_MS)) {
-      sendPing();
-    } else if (g_ping_pending && (now - g_last_ping_ms >= PONG_TIMEOUT_MS)) {
-      log_e("PONG timeout — reconnecting");
-      break;
-    }
+    checkKeepalive();
+    if (g_tunnel_dead) { log_e("Keepalive timeout — reconnecting"); break; }
 
     // Check for incoming frame
     if (g_tunnel.available() == 0) { delay(10); continue; }
@@ -642,6 +737,7 @@ void runTunnelSession() {
     if (!tunnelRead(hdr, FRAME_HEADER_SIZE, 2000)) {
       log_e("Frame header read failed"); break;
     }
+    noteFrameReceived();
 
     uint8_t  ftype     = hdr[0];
     uint32_t stream_id = ((uint32_t)hdr[1] << 24) | ((uint32_t)hdr[2] << 16) |
@@ -678,8 +774,6 @@ void runTunnelSession() {
 
       case FRAME_PONG:
         if (!tunnelDrain(flen)) { running = false; break; }
-        g_ping_pending = false;
-        g_last_ping_ms = millis();  // reset interval from PONG receipt
         log_d("PONG received");
         break;
 

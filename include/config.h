@@ -23,7 +23,9 @@
 #define MAX_TUNNEL_DOMAINS  8
 // Max REQUEST frame payload accepted (4 KB per ESP32 subset spec)
 #define MAX_REQUEST_PAYLOAD 4096
-// Max response body buffered before streaming as DATA frames
+// Max REQUEST body buffered (browser -> backend). Response bodies (backend ->
+// browser) are streamed straight into DATA frames and aren't size-limited by
+// this constant — see readBackendChunk()/readBackendLine() in tunnel_client.cpp.
 #define MAX_RESPONSE_BODY   32768
 // DATA frame chunk size
 #define DATA_CHUNK_SIZE     2048
