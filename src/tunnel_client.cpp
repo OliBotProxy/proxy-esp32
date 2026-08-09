@@ -176,6 +176,12 @@ static void checkKeepalive() {
   if (g_tunnel_dead) return;
   uint32_t now = millis();
   if (g_ping_pending) {
+    // Single-stream: the PONG (or anything else) can be sitting fully-arrived
+    // but unread behind other queued REQUEST frames ahead of it in the same
+    // ordered TCP stream, while we're still busy handling an earlier one. Bytes
+    // already waiting to be read prove the connection is alive even before we
+    // get to them, so don't declare it dead out from under a legitimate backlog.
+    if (g_tunnel.available() > 0) return;
     if (now - g_ping_sent_ms >= PONG_TIMEOUT_MS) {
       log_e("Keepalive timeout — nothing received since PING sent %lums ago", (unsigned long)(now - g_ping_sent_ms));
       g_tunnel_dead = true;
@@ -491,6 +497,7 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
     sendReset(stream_id, RESET_BACKEND_UNREACHABLE); return;
   }
   g_backend.setTimeout(10);
+  g_backend.setNoDelay(true);  // don't let Nagle batch our chunked reads/writes
 
   // Send request + optional body
   g_backend.print(http_req);
@@ -675,6 +682,7 @@ void runTunnelSession() {
   if (!g_tunnel.connect(proxy_host.c_str(), proxy_port)) {
     log_e("%s connect to proxy failed", mode); return;
   }
+  g_tunnel.setNoDelay(true);  // don't let Nagle batch our chunked reads/writes
   log_i("Connected to proxy (%s)", mode);
 
   // 3. Send CONNECT frame

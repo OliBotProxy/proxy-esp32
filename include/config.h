@@ -27,8 +27,12 @@
 // browser) are streamed straight into DATA frames and aren't size-limited by
 // this constant — see readBackendChunk()/readBackendLine() in tunnel_client.cpp.
 #define MAX_RESPONSE_BODY   32768
-// DATA frame chunk size
-#define DATA_CHUNK_SIZE     2048
+// DATA frame chunk size, and the read size used when streaming a response from
+// the backend. Larger = fewer round-trips through readBackendChunk()/sendFrame()
+// per file (each has its own fixed overhead), at the cost of a bigger static
+// buffer — cheap tradeoff given ~300 KB of free heap. 8 KB cuts round-trips ~4x
+// versus the previous 2 KB with negligible RAM impact.
+#define DATA_CHUNK_SIZE     8192
 
 // ── Ethernet (USE_ETHERNET builds) ───────────────────────────────────────────
 // ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER,
