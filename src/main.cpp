@@ -63,13 +63,20 @@ static bool networkReady() { return s_eth_ready; }
 static void connectNetwork() {
   log_i("Connecting to WiFi: %s", getWifiSsid());
   WiFi.mode(WIFI_STA);
+  // Disable modem sleep. The Arduino default (WIFI_PS_MIN_MODEM) parks the radio
+  // between DTIM beacons, which adds beacon-interval latency to every TCP
+  // round-trip and throttles sustained transfers to a fraction of link speed
+  // (measured here: ~180 kbit/s relaying a 1 MB response, vs multi-Mbit/s with
+  // sleep off). This device is mains-powered and must relay traffic promptly,
+  // so trade idle current for throughput.
+  WiFi.setSleep(false);
   WiFi.begin(getWifiSsid(), getWifiPass());
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print('.');
   }
   Serial.println();
-  log_i("WiFi connected, IP: %s", WiFi.localIP().toString().c_str());
+  log_i("WiFi connected, IP: %s (modem sleep disabled)", WiFi.localIP().toString().c_str());
 }
 
 static bool networkReady() { return WiFi.status() == WL_CONNECTED; }

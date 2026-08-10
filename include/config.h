@@ -28,11 +28,12 @@
 // this constant — see readBackendChunk()/readBackendLine() in tunnel_client.cpp.
 #define MAX_RESPONSE_BODY   32768
 // DATA frame chunk size, and the read size used when streaming a response from
-// the backend. Larger = fewer round-trips through readBackendChunk()/sendFrame()
-// per file (each has its own fixed overhead), at the cost of a bigger static
-// buffer — cheap tradeoff given ~300 KB of free heap. 8 KB cuts round-trips ~4x
-// versus the previous 2 KB with negligible RAM impact.
-#define DATA_CHUNK_SIZE     8192
+// the backend. Measured on ESP32-S3 (RSSI -48 dBm, modem sleep off): relay
+// throughput is ~48 KB/s and scales exactly with bytes regardless of this value
+// (4 KB → 82 ms/chunk, 16 KB → 322 ms/chunk), i.e. the tunnel upload is
+// bandwidth-bound, not per-frame-bound. So there's nothing to win by going
+// larger — keep it small to save static RAM.
+#define DATA_CHUNK_SIZE     4096
 
 // ── Ethernet (USE_ETHERNET builds) ───────────────────────────────────────────
 // ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER,

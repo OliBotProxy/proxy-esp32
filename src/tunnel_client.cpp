@@ -15,6 +15,9 @@
 #include "config.h"
 #include <NetworkClient.h>
 #include <NetworkClientSecure.h>
+#ifndef USE_ETHERNET
+  #include <WiFi.h>   // RSSI reporting in the per-request profile log
+#endif
 #include <Arduino.h>
 #ifdef TUNNEL_TLS_VERIFY_CERT
   #include "certs.h"
@@ -81,6 +84,24 @@ static bool     g_ping_pending;
 static bool     g_tunnel_dead;   // set once a pending ping goes unanswered too long
 static uint8_t  g_ping_seq;      // monotonic counter in PING opaque[0], matches rust-client
 
+// Running count of REQUEST frames handled this session — logged with each
+// request so a hang/leak can be correlated to "which request number" it started at.
+static uint32_t g_request_counter;
+
+// Per-request body-relay profiling: time spent reading from the local backend
+// vs writing to the tunnel, to tell read-bound from write-bound.
+static uint32_t g_prof_read_ms, g_prof_write_ms, g_prof_chunks;
+
+// WiFi signal strength, for correlating throughput with link quality
+// (Ethernet builds have no RSSI — report 0).
+static int currentRssi() {
+#ifdef USE_ETHERNET
+  return 0;
+#else
+  return WiFi.RSSI();
+#endif
+}
+
 // Shared buffers (single-stream: REQUEST and body are sequential, not concurrent)
 static uint8_t g_frame_buf[MAX_REQUEST_PAYLOAD];  // incoming REQUEST payload
 static uint8_t g_body_buf[MAX_RESPONSE_BODY];     // request body in / response body out
@@ -129,9 +150,8 @@ static bool tunnelDrain(uint32_t len) {
 
 // ── Frame send helpers ────────────────────────────────────────────────────────
 
-static bool sendFrame(uint8_t type, uint32_t stream_id, uint8_t flags,
-                      const uint8_t* payload, uint32_t payload_len) {
-  uint8_t hdr[FRAME_HEADER_SIZE];
+static void fillFrameHeader(uint8_t* hdr, uint8_t type, uint32_t stream_id,
+                            uint8_t flags, uint32_t payload_len) {
   hdr[0] = type;
   hdr[1] = (stream_id >> 24) & 0xFF;
   hdr[2] = (stream_id >> 16) & 0xFF;
@@ -142,9 +162,28 @@ static bool sendFrame(uint8_t type, uint32_t stream_id, uint8_t flags,
   hdr[7] = (payload_len >> 16) & 0xFF;
   hdr[8] = (payload_len >>  8) & 0xFF;
   hdr[9] =  payload_len        & 0xFF;
+}
+
+static bool sendFrame(uint8_t type, uint32_t stream_id, uint8_t flags,
+                      const uint8_t* payload, uint32_t payload_len) {
+  uint8_t hdr[FRAME_HEADER_SIZE];
+  fillFrameHeader(hdr, type, stream_id, flags, payload_len);
   if (!tunnelWrite(hdr, FRAME_HEADER_SIZE)) return false;
   if (payload_len > 0 && !tunnelWrite(payload, payload_len)) return false;
   return true;
+}
+
+// Single-write frame send, for the hot body-streaming path. `buf` must have
+// FRAME_HEADER_SIZE bytes of scratch space at the front, with the payload
+// starting at buf + FRAME_HEADER_SIZE. Emitting the header and payload as two
+// separate writes puts each on its own TCP segment (TCP_NODELAY is on), so a
+// body relay pays two packets — and often two round-trips — per frame. That
+// stop-and-wait pattern, not bandwidth, was capping throughput at ~1 segment
+// per RTT (~44 KB/s to Frankfurt).
+static bool sendFrameInline(uint8_t* buf, uint8_t type, uint32_t stream_id,
+                            uint8_t flags, uint32_t payload_len) {
+  fillFrameHeader(buf, type, stream_id, flags, payload_len);
+  return tunnelWrite(buf, FRAME_HEADER_SIZE + payload_len);
 }
 
 static void sendReset(uint32_t stream_id, uint16_t error_code) {
@@ -158,7 +197,8 @@ static void sendPing() {
   sendFrame(FRAME_PING, 0, 0, opaque, 8);
   g_ping_pending = true;
   g_ping_sent_ms = millis();
-  log_d("PING sent (seq=%u)", g_ping_seq);
+  log_i("PING sent (seq=%u, requests_so_far=%lu, heap=%u)",
+        g_ping_seq, (unsigned long)g_request_counter, (unsigned)ESP.getFreeHeap());
 }
 
 // Call whenever any frame is successfully read from the tunnel — proves the
@@ -361,25 +401,36 @@ static bool parseConfig(const uint8_t* payload, uint32_t len) {
 // read from the backend, never fully buffered — so response size isn't capped
 // by MAX_RESPONSE_BODY (that buffer is used for the request body only).
 
-// Read up to `max_len` bytes from g_backend into buf. Waits up to `timeout_ms`
-// for the first byte, then drains whatever else is immediately available and
-// returns promptly rather than blocking to fill the buffer (keeps DATA frames
-// flowing at backend speed instead of batching). Returns 0 on idle timeout or
-// backend close with nothing pending (both signal "no more data right now").
+// Read up to `max_len` bytes from g_backend into buf, waiting up to `timeout_ms`
+// for the first byte. Once some data is in hand it keeps trying to fill the
+// buffer, giving up only after FILL_GRACE_MS with nothing new — returning on the
+// first partial read instead would emit a DATA frame per TCP segment, and each
+// tiny frame costs a full round-trip to the proxy. Filling the buffer is what
+// makes the body relay bandwidth-bound rather than latency-bound.
+// Returns 0 on idle timeout or backend close with nothing pending.
 static uint32_t readBackendChunk(uint8_t* buf, uint32_t max_len, uint32_t timeout_ms) {
+  const uint32_t FILL_GRACE_MS = 15;
   uint32_t got = 0;
   uint32_t deadline = millis() + timeout_ms;
+  uint32_t idle_since = 0;
   while (got < max_len) {
     if (g_backend.available()) {
       int n = g_backend.read(buf + got, max_len - got);
-      if (n > 0) { got += n; deadline = millis() + timeout_ms; continue; }
+      if (n > 0) { got += n; idle_since = 0; deadline = millis() + timeout_ms; continue; }
     }
-    if (got > 0) break;
     if (!g_backend.connected()) break;
-    if ((int32_t)(millis() - deadline) >= 0) break;
-    serviceTunnelKeepalive();
-    if (g_tunnel_dead) break;
-    delay(2);
+    if (got > 0) {
+      // Partial buffer: brief wait for the rest so one frame carries more,
+      // but never stall a response that's simply finished arriving.
+      uint32_t now = millis();
+      if (idle_since == 0) idle_since = now;
+      else if (now - idle_since >= FILL_GRACE_MS) break;
+    } else {
+      if ((int32_t)(millis() - deadline) >= 0) break;
+      serviceTunnelKeepalive();
+      if (g_tunnel_dead) break;
+    }
+    delay(1);
   }
   return got;
 }
@@ -432,6 +483,13 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
     sendReset(stream_id, RESET_INTERNAL_ERROR); return;
   }
 
+  uint32_t req_start_ms = millis();
+  uint32_t req_num = ++g_request_counter;
+  g_prof_read_ms = g_prof_write_ms = g_prof_chunks = 0;
+  log_i("REQUEST #%lu stream=%lu %s %s -> %s:%u (heap=%u)",
+        (unsigned long)req_num, (unsigned long)stream_id, method, path,
+        backend_host, backend_port, (unsigned)ESP.getFreeHeap());
+
   // headers: u16 count, then (u8-str name, u16-str value) pairs
   if (pos + 2 > payload_len) { sendReset(stream_id, RESET_INTERNAL_ERROR); return; }
   uint16_t hdr_count = ((uint16_t)payload[pos] << 8) | payload[pos + 1]; pos += 2;
@@ -446,7 +504,11 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
       sendReset(stream_id, RESET_INTERNAL_ERROR); return;
     }
     String ln = hname; ln.toLowerCase();
-    if (ln == "connection" || ln == "keep-alive") continue;
+    // content-length/transfer-encoding are skipped here and re-added below from
+    // the actual collected body — forwarding the browser's original alongside our
+    // own would send two Content-Length headers, which Jetty (and HTTP spec,
+    // as a request-smuggling guard) rejects with "400 Multiple Content-Lengths".
+    if (ln == "connection" || ln == "keep-alive" || ln == "content-length" || ln == "transfer-encoding") continue;
     http_req += String(hname) + ": " + hval + "\r\n";
   }
   http_req += "Connection: close\r\n";
@@ -493,11 +555,13 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
 
   // Connect to local backend
   if (!g_backend.connect(backend_host, backend_port)) {
-    log_e("Backend unreachable: %s:%u (domain_id=%u)", backend_host, backend_port, domain_id);
+    log_e("REQUEST #%lu: backend unreachable: %s:%u (domain_id=%u, heap=%u)",
+          (unsigned long)req_num, backend_host, backend_port, domain_id, (unsigned)ESP.getFreeHeap());
     sendReset(stream_id, RESET_BACKEND_UNREACHABLE); return;
   }
   g_backend.setTimeout(10);
   g_backend.setNoDelay(true);  // don't let Nagle batch our chunked reads/writes
+  log_i("REQUEST #%lu: backend connected (+%lums)", (unsigned long)req_num, (unsigned long)(millis() - req_start_ms));
 
   // Send request + optional body
   g_backend.print(http_req);
@@ -519,9 +583,12 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
     delay(2);
   }
   if (!headers_done) {
+    log_e("REQUEST #%lu: backend header timeout (+%lums, heap=%u)",
+          (unsigned long)req_num, (unsigned long)(millis() - req_start_ms), (unsigned)ESP.getFreeHeap());
     g_backend.stop();
     sendReset(stream_id, RESET_BACKEND_TIMEOUT); return;
   }
+  log_i("REQUEST #%lu: backend headers done (+%lums)", (unsigned long)req_num, (unsigned long)(millis() - req_start_ms));
 
   // Parse status code
   int sp1 = resp_raw.indexOf(' ');
@@ -568,12 +635,18 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
 
   // Build RESPONSE frame payload: u16 status + u16 count + [u8 nlen + name + u16 vlen + value]*
   static uint8_t resp_payload[4096];
+  // Worst case per header: 1 (nlen) + 255 (name) + 2 (vlen) + 1023 (value) = 1281 B.
+  // The loop guard must leave at least that much headroom, checked *before* each
+  // iteration — 600 B was short of that, allowing a real overflow past resp_payload's
+  // end (and whatever static memory follows it) for any single header over ~600 B
+  // (e.g. a long Set-Cookie or CORS header), corrupting unrelated state.
+  static const uint32_t MAX_HEADER_ENTRY = 1 + 255 + 2 + 1023;
   uint32_t rp = 0;
   resp_payload[rp++] = (status_code >> 8) & 0xFF;
   resp_payload[rp++] = status_code & 0xFF;
   resp_payload[rp++] = (resp_hdr_count >> 8) & 0xFF;
   resp_payload[rp++] = resp_hdr_count & 0xFF;
-  for (uint16_t i = 0; i < resp_hdr_count && rp < sizeof(resp_payload) - 600; i++) {
+  for (uint16_t i = 0; i < resp_hdr_count && rp < sizeof(resp_payload) - MAX_HEADER_ENTRY; i++) {
     const char* n = resp_headers[i].name.c_str();
     const char* v = resp_headers[i].value.c_str();
     uint8_t  nlen = (uint8_t)min((int)strlen(n), 255);
@@ -587,24 +660,36 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
 
   uint8_t resp_flags = no_body ? 0 : FLAG_RESPONSE_HAS_BODY;
   sendFrame(FRAME_RESPONSE, stream_id, resp_flags, resp_payload, rp);
+  log_i("REQUEST #%lu: status=%u content_length=%ld chunked=%d no_body=%d (+%lums)",
+        (unsigned long)req_num, status_code, (long)content_length, (int)is_chunked, (int)no_body,
+        (unsigned long)(millis() - req_start_ms));
 
   // Stream the response body straight from the backend into DATA frames —
   // never fully buffered, so size isn't capped by MAX_RESPONSE_BODY.
   uint32_t streamed_total = 0;
   if (!no_body) {
-    static uint8_t stream_buf[DATA_CHUNK_SIZE];
+    // Header space up front so each DATA frame goes out in a single write —
+    // payload lives at stream_buf + FRAME_HEADER_SIZE (see sendFrameInline).
+    static uint8_t stream_buf[FRAME_HEADER_SIZE + DATA_CHUNK_SIZE];
+    uint8_t* const chunk_buf = stream_buf + FRAME_HEADER_SIZE;
     bool end_stream_sent = false;
 
     if (content_length >= 0) {
       uint32_t remaining = (uint32_t)content_length;
       while (remaining > 0) {
         uint32_t want = min((uint32_t)DATA_CHUNK_SIZE, remaining);
-        uint32_t got = readBackendChunk(stream_buf, want, 10000);
+        uint32_t t0 = millis();
+        uint32_t got = readBackendChunk(chunk_buf, want, 10000);
+        uint32_t t1 = millis();
         if (got == 0) break;  // backend closed/stalled early — end the stream with what we have
         remaining -= got;
         streamed_total += got;
         bool last = (remaining == 0);
-        sendFrame(FRAME_DATA, stream_id, last ? FLAG_END_STREAM : 0, stream_buf, got);
+        sendFrameInline(stream_buf, FRAME_DATA, stream_id, last ? FLAG_END_STREAM : 0, got);
+        uint32_t t2 = millis();
+        g_prof_read_ms += (t1 - t0);
+        g_prof_write_ms += (t2 - t1);
+        g_prof_chunks++;
         if (last) end_stream_sent = true;
         serviceTunnelKeepalive();
       }
@@ -612,8 +697,9 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
       char line[16];
       while (true) {
         int n = readBackendLine(line, sizeof(line), 10000);
-        if (n < 0) break;  // timeout/close mid-stream — end with what we have
+        if (n < 0) { log_w("REQUEST #%lu: chunk-size line timeout/close (total=%lu)", (unsigned long)req_num, (unsigned long)streamed_total); break; }
         uint32_t chunk_size = (uint32_t)strtoul(line, nullptr, 16);
+        log_d("REQUEST #%lu: chunk_size=0x%s (%lu) line_len=%d", (unsigned long)req_num, line, (unsigned long)chunk_size, n);
         if (chunk_size == 0) {
           char trail[4];
           readBackendLine(trail, sizeof(trail), 2000);  // trailing CRLF after "0"
@@ -623,11 +709,11 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
         bool chunk_ok = true;
         while (remaining > 0) {
           uint32_t want = min((uint32_t)DATA_CHUNK_SIZE, remaining);
-          uint32_t got = readBackendChunk(stream_buf, want, 10000);
+          uint32_t got = readBackendChunk(chunk_buf, want, 10000);
           if (got == 0) { chunk_ok = false; break; }
           remaining -= got;
           streamed_total += got;
-          sendFrame(FRAME_DATA, stream_id, 0, stream_buf, got);
+          sendFrameInline(stream_buf, FRAME_DATA, stream_id, 0, got);
           serviceTunnelKeepalive();
         }
         if (!chunk_ok) break;
@@ -639,10 +725,10 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
       // since our own outgoing request always sends "Connection: close").
       const uint32_t SAFETY_CAP = 8UL * 1024 * 1024;  // guards against a backend that never closes
       while (streamed_total < SAFETY_CAP) {
-        uint32_t got = readBackendChunk(stream_buf, DATA_CHUNK_SIZE, 10000);
+        uint32_t got = readBackendChunk(chunk_buf, DATA_CHUNK_SIZE, 10000);
         if (got == 0) break;
         streamed_total += got;
-        sendFrame(FRAME_DATA, stream_id, 0, stream_buf, got);
+        sendFrameInline(stream_buf, FRAME_DATA, stream_id, 0, got);
         serviceTunnelKeepalive();
       }
     }
@@ -651,8 +737,18 @@ static void handleRequest(uint32_t stream_id, uint8_t req_flags,
   }
   g_backend.stop();
 
-  log_d("stream %lu: %s %s -> %u (%lu B streamed)", (unsigned long)stream_id,
-        method, path, status_code, (unsigned long)streamed_total);
+  uint32_t req_ms = millis() - req_start_ms;
+  log_i("REQUEST #%lu done: %s %s -> %u (%lu B, %lums, %luKB/s, heap=%u)",
+        (unsigned long)req_num, method, path, status_code,
+        (unsigned long)streamed_total, (unsigned long)req_ms,
+        (unsigned long)(req_ms ? (streamed_total / req_ms) : 0), (unsigned)ESP.getFreeHeap());
+  if (g_prof_chunks) {
+    log_i("REQUEST #%lu profile: %lu chunks, read=%lums write=%lums (avg read=%lums write=%lums per chunk), rssi=%d dBm",
+          (unsigned long)req_num, (unsigned long)g_prof_chunks,
+          (unsigned long)g_prof_read_ms, (unsigned long)g_prof_write_ms,
+          (unsigned long)(g_prof_read_ms / g_prof_chunks), (unsigned long)(g_prof_write_ms / g_prof_chunks),
+          currentRssi());
+  }
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -733,6 +829,7 @@ void runTunnelSession() {
   g_ping_pending = false;
   g_tunnel_dead = false;
   g_ping_seq = 0;
+  g_request_counter = 0;
   bool running = true;
 
   while (running && g_tunnel.connected()) {

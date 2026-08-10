@@ -145,6 +145,32 @@ board = lolin32
 board = az-delivery-devkit-v4
 ```
 
+## Throughput
+
+Measured ESP32-S3 → proxy (Frankfurt), RSSI -48 dBm, relaying a 1 MB response
+from a LAN backend:
+
+| Config | Result |
+|--------|--------|
+| Modem sleep on (Arduino default) | ~22 KB/s, wildly variable (20-60 s for 1 MB) |
+| `WiFi.setSleep(false)` | **~48 KB/s, consistent** |
+
+`WiFi.setSleep(false)` in `main.cpp`'s `connectNetwork()` is the single biggest
+win — the default `WIFI_PS_MIN_MODEM` parks the radio between DTIM beacons,
+adding beacon latency to every TCP round-trip.
+
+Profiling (`REQUEST #n profile:` log line) shows the split clearly: reading from
+the local backend is ~1 ms/chunk, writing to the tunnel is ~82 ms per 4 KB — so
+the relay is bound almost entirely by ESP32 TCP upload to the proxy. Throughput
+scales exactly with bytes regardless of `DATA_CHUNK_SIZE`, so it's
+bandwidth-bound, not per-frame-bound; tuning chunk size gains nothing.
+
+**Practical implication:** ~48 KB/s means a 2 MB single-page app takes ~45 s to
+load through an ESP32 tunnel, made worse by single-stream (requests are served
+one at a time, so a browser's parallel fetches queue). The ESP32 is well suited
+to its own small status/control pages; front heavy web apps with the full
+`tunnel-client` instead (same content loads in ~1.5 s there).
+
 ## Memory budget
 
 | Buffer | Size | Location |
