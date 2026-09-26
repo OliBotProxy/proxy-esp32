@@ -10,8 +10,12 @@
 // TLS tunnel port (server tunnel_port_tls, default 8778)
 #define TUNNEL_PROXY_TLS_PORT_DEFAULT 8778
 
-// Reconnect delay after a session ends (milliseconds)
-#define RECONNECT_DELAY_MS 3000
+// Reconnect delay after a session ends (milliseconds). Doubles after each
+// quick failure up to MAX_RECONNECT_DELAY_MS; resets once a session stays up
+// for HEALTHY_SESSION_MS.
+#define RECONNECT_DELAY_MS     3000
+#define MAX_RECONNECT_DELAY_MS 60000
+#define HEALTHY_SESSION_MS     60000
 
 // ── Keepalive ─────────────────────────────────────────────────────────────────
 #define PING_INTERVAL_MS 30000   // send PING every 30 s

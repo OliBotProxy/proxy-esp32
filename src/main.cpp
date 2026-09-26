@@ -167,8 +167,17 @@ void loop() {
     return;
   }
 
-  runTunnelSession();
+  // Exponential backoff between failed sessions: a fixed delay meant a device
+  // that can never connect (expired proxy cert, suspended tunnel) retried every
+  // few seconds forever. A session that stayed up counts as healthy — e.g. the
+  // proxy closed it to apply a config change — so reconnect promptly.
+  static uint32_t reconnectDelayMs = RECONNECT_DELAY_MS;
 
-  log_i("Reconnecting in %d ms...", RECONNECT_DELAY_MS);
-  delay(RECONNECT_DELAY_MS);
+  uint32_t started = millis();
+  runTunnelSession();
+  if (millis() - started >= HEALTHY_SESSION_MS) reconnectDelayMs = RECONNECT_DELAY_MS;
+
+  log_i("Reconnecting in %u ms...", (unsigned)reconnectDelayMs);
+  delay(reconnectDelayMs);
+  reconnectDelayMs = min(reconnectDelayMs * 2, (uint32_t)MAX_RECONNECT_DELAY_MS);
 }
