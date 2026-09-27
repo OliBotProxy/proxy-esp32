@@ -123,7 +123,7 @@ Measured on an ESP32-S3 at RSSI -48 dBm relaying to a proxy in Frankfurt.
 
 These are platform realities, not bugs. For comparison, the same page that takes
 ~35 s through an ESP32 loads in ~1.5 s through the desktop
-[`tunnel-client`](https://github.com/OliBotProxy/rust-client).
+[`tunnel-client`](https://github.com/clientproxy-io/tunnel-client).
 
 > **Power note:** the firmware calls `WiFi.setSleep(false)`. WiFi modem sleep
 > (the Arduino default) parks the radio between beacons and cuts throughput to
