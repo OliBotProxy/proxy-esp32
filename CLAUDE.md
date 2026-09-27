@@ -63,7 +63,7 @@ src/
 | Macro | Default | Description |
 |-------|---------|-------------|
 | `WIFI_SSID` / `WIFI_PASSWORD` | — | WiFi credentials |
-| `TUNNEL_API_HOST` | `api-us.oli.bot` | Regional API host (`api-eu`, `api-asia`) |
+| `TUNNEL_API_HOST` | `api-us.clientproxy.io` | Regional API host (`api-eu`, `api-asia`) |
 | `TUNNEL_API_PORT` | `443` | HTTPS port for bootstrap API call |
 | `TUNNEL_ID` | — | Tunnel ID from proxy-admin dashboard |
 | `TUNNEL_API_KEY` | — | `<subscriptionId>_<salt>` from dashboard |
@@ -83,7 +83,7 @@ setup()
 
 loop()
   └─ runTunnelSession()
-       ├─ fetchProxyAddress()   HTTPS GET api-us.oli.bot/api/client-tunnel/{id}
+       ├─ fetchProxyAddress()   HTTPS GET api-us.clientproxy.io/api/client-tunnel/{id}
        │                        Authorization: Bearer {api_key}
        │                        → proxyAddress field (e.g. "92.5.152.130:8779")
        ├─ g_tunnel.connect(host, port)   plain TCP (8779) or TLS (8778)

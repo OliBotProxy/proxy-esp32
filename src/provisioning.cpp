@@ -24,7 +24,7 @@ static char s_wifi_pass[64] = {};
 #endif
 static bool s_loaded = false;
 
-const char* getApiHost()  { return s_api_host[0] ? s_api_host : "api-us.oli.bot"; }
+const char* getApiHost()  { return s_api_host[0] ? s_api_host : "api-us.clientproxy.io"; }
 const char* getTunnelId() { return s_tunnel_id; }
 const char* getApiKey()   { return s_api_key;   }
 #ifndef USE_ETHERNET
@@ -44,7 +44,24 @@ void loadParams() {
 #endif
   prefs.end();
 
-  if (s_api_host[0] == '\0') strlcpy(s_api_host, "api-us.oli.bot", sizeof(s_api_host));
+  if (s_api_host[0] == '\0') {
+    strlcpy(s_api_host, "api-us.clientproxy.io", sizeof(s_api_host));
+  } else {
+    // Existing devices retain the selected API host in NVS across firmware updates.
+    // Move only the three former hosted endpoints; leave custom hosts alone.
+    const char* oldHosts[] = {"api-us.oli.bot", "api-eu.oli.bot", "api-asia.oli.bot"};
+    const char* newHosts[] = {"api-us.clientproxy.io", "api-eu.clientproxy.io", "api-asia.clientproxy.io"};
+    for (size_t i = 0; i < 3; ++i) {
+      if (strcmp(s_api_host, oldHosts[i]) == 0) {
+        strlcpy(s_api_host, newHosts[i], sizeof(s_api_host));
+        Preferences migration;
+        migration.begin(NVS_NS, false);
+        migration.putString("api_host", s_api_host);
+        migration.end();
+        break;
+      }
+    }
+  }
 
   s_loaded = (strlen(s_tunnel_id) > 0) && (strlen(s_api_key) > 0)
 #ifndef USE_ETHERNET
@@ -119,9 +136,9 @@ static const char HTML_PAGE[] =
   "<hr>"
   "<label>API Region</label>"
   "<select name='host'>"
-    "<option value='api-us.oli.bot'{SEL_US}>United States</option>"
-    "<option value='api-eu.oli.bot'{SEL_EU}>Europe</option>"
-    "<option value='api-asia.oli.bot'{SEL_ASIA}>Asia</option>"
+    "<option value='api-us.clientproxy.io'{SEL_US}>United States</option>"
+    "<option value='api-eu.clientproxy.io'{SEL_EU}>Europe</option>"
+    "<option value='api-asia.clientproxy.io'{SEL_ASIA}>Asia</option>"
   "</select>"
   "<label>Tunnel ID</label>"
   "<input name='tid' value='{TID}' autocomplete='off' spellcheck='false' required>"
@@ -165,9 +182,9 @@ static String buildPage(const String& error = "") {
     "<div class='err'>" + error + "</div>");
 
   String host = s_api_host;
-  html.replace("{SEL_US}",   host == "api-us.oli.bot"   ? " selected" : "");
-  html.replace("{SEL_EU}",   host == "api-eu.oli.bot"   ? " selected" : "");
-  html.replace("{SEL_ASIA}", host == "api-asia.oli.bot"  ? " selected" : "");
+  html.replace("{SEL_US}",   host == "api-us.clientproxy.io"   ? " selected" : "");
+  html.replace("{SEL_EU}",   host == "api-eu.clientproxy.io"   ? " selected" : "");
+  html.replace("{SEL_ASIA}", host == "api-asia.clientproxy.io"  ? " selected" : "");
   html.replace("{TID}", String(s_tunnel_id));
   html.replace("{KEY}", String(s_api_key));
   return html;
@@ -208,7 +225,7 @@ static void handlePost() {
     return;
   }
 
-  if (host.isEmpty()) host = "api-us.oli.bot";
+  if (host.isEmpty()) host = "api-us.clientproxy.io";
 
   Preferences prefs;
   prefs.begin(NVS_NS, false);

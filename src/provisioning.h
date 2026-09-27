@@ -19,7 +19,7 @@ void checkProvisioningReset();
 void runProvisioning();
 
 // Credential getters — valid after loadParams() succeeds.
-const char* getApiHost();     // e.g. "api-us.oli.bot"
+const char* getApiHost();     // e.g. "api-us.clientproxy.io"
 const char* getTunnelId();
 const char* getApiKey();      // "<subscriptionId>_<salt>"
 #ifndef USE_ETHERNET

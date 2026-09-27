@@ -116,7 +116,7 @@ static void handleDemoRoot() {
     "td:last-child{text-align:right;font-family:ui-monospace,monospace}"
     "</style></head><body><div class='card'>"
     "<h1>&#9989; It works!</h1>"
-    "<p class='sub'>Served locally by this ESP32 and reached through an oli.bot tunnel.</p>"
+    "<p class='sub'>Served locally by this ESP32 and reached through a clientproxy.io tunnel.</p>"
     "<table>"
     "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>"
     "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB</td></tr>"

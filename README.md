@@ -1,7 +1,7 @@
 # proxy-esp32 — Demo Setup Guide
 
 Turn an ESP32 into a live web server reachable from the internet through an
-[oli.bot](https://oli.bot) tunnel — no port forwarding, no static IP. This
+[clientproxy.io](https://clientproxy.io) tunnel — no port forwarding, no static IP. This
 guide walks through flashing the firmware, provisioning credentials on the
 device itself (nothing secret ever goes in source control), and pointing a
 tunnel domain at the device's built-in demo page.
@@ -12,14 +12,14 @@ The firmware ships with a small demo web server (`main.cpp`) that serves a
 status page — uptime, free heap, local IP, chip model — on port 80 of the
 device's local IP. That's the "local backend" a tunnel domain forwards
 requests to, so it's a quick way to confirm the whole path (browser →
-oli.bot proxy → tunnel → device → back) works end to end before wiring up
+clientproxy.io proxy → tunnel → device → back) works end to end before wiring up
 your own application.
 
 ## Prerequisites
 
 - An ESP32 DevKit (WiFi) or a Waveshare ESP32-P4-ETH (Ethernet) board
 - [PlatformIO](https://platformio.org/) (CLI or the VS Code extension)
-- An oli.bot account with a tunnel created in the dashboard, and its
+- A clientproxy.io account with a tunnel created in the dashboard, and its
   **Tunnel ID** + **API Key** (`Dashboard → Client Tunnels`)
 
 ## 1. Flash the firmware
@@ -77,7 +77,7 @@ Demo web server listening on 192.168.0.233:80
 
 ## 4. Point a tunnel domain at the device
 
-In the oli.bot dashboard (`Client Tunnels → your tunnel → domains`), add or
+In the clientproxy.io dashboard (`Client Tunnels → your tunnel → domains`), add or
 edit a domain and set **Local IP** to the device's address from step 3, port
 `80` — e.g. `192.168.0.233:80`.
 
